@@ -137,6 +137,7 @@ function getInitialError() {
   if (error === 'oauth_not_configured') return 'اتصال گوگل هنوز روی سرور تنظیم نشده است.'
   if (error === 'oauth_state') return 'درخواست ورود منقضی شد؛ لطفاً دوباره تلاش کنید.'
   if (error === 'session') return 'ساخت نشست ورود ناموفق بود؛ دوباره تلاش کنید.'
+  if (error === 'server_not_configured') return 'ورود در دسترس نیست؛ اتصال Google، PostgreSQL و کلید رمزنگاری را روی سرور تنظیم کنید.'
   return error
 }
 
@@ -215,7 +216,7 @@ function LoginScreen({ configured, error }) {
               <div className="setup-card-icon"><Settings2 size={17} /></div>
               <div>
                 <strong>یک قدم تا اتصال واقعی</strong>
-                <p>مقادیر OAuth را در فایل <code>.env</code> قرار دهید. راهنمای کامل داخل README پروژه است.</p>
+                <p>مقادیر OAuth گوگل، <code>DATABASE_URL</code> و <code>ENCRYPTION_KEY</code> را در فایل <code>.env</code> قرار دهید. راهنمای کامل داخل README پروژه است.</p>
               </div>
             </div>
           ) : (

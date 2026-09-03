@@ -4,8 +4,31 @@ import { fileURLToPath } from 'node:url'
 import crypto from 'node:crypto'
 import express from 'express'
 import session from 'express-session'
-import { google } from 'googleapis'
+import connectPgSimple from 'connect-pg-simple'
 import { createServer as createViteServer } from 'vite'
+
+import { getPool, dbConfigured, runMigrations, closePool } from './db/index.js'
+import {
+  findUserById,
+  upsertUser,
+  upsertOAuthAccount,
+  getDecryptedTokens,
+  updateAccountTokens,
+  listUserSites,
+  syncUserSites,
+} from './db/users.js'
+import { encryptionConfigured } from './lib/crypto.js'
+import {
+  oauthConfigured,
+  getAuthUrl,
+  exchangeCodeForTokens,
+  buildAuthorizedClient,
+  listAccessibleSites,
+  assertAccessibleSite,
+  searchAnalyticsQuery,
+  getGoogleApiError,
+} from './lib/google.js'
+import { readRange, aggregateRows, rowItem, shiftDate, metricChanges, buildInsights } from './lib/analytics.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -13,415 +36,216 @@ const __dirname = path.dirname(__filename)
 const app = express()
 const port = Number(process.env.PORT || 4173)
 const isProduction = process.env.NODE_ENV === 'production'
-const isConfigured = Boolean(
-  process.env.GOOGLE_CLIENT_ID &&
-    process.env.GOOGLE_CLIENT_SECRET &&
-    process.env.GOOGLE_REDIRECT_URI,
-)
-const demoMode = process.env.DEMO_MODE === 'true'
 const sessionSecret = process.env.SESSION_SECRET || 'searchlight-local-development-secret'
+
+// Real, persistent, multi-user mode requires all three to be configured.
+const isReady = oauthConfigured && dbConfigured && encryptionConfigured
+const SESSION_COOKIE = 'searchlight.sid'
+const MAX_SESSION_AGE_MS = 1000 * 60 * 60 * 24 * 30
+
+// --- Express setup --------------------------------------------------------
 
 app.set('trust proxy', 1)
 app.use(express.json({ limit: '1mb' }))
-app.use(
-  session({
-    name: 'searchlight.sid',
-    secret: sessionSecret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: isProduction,
-      maxAge: 1000 * 60 * 60 * 24 * 14,
-    },
-  }),
-)
 
-function createOAuthClient() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI,
-  )
+// Session store: PostgreSQL (via connect-pg-simple) when the DB is present so
+// sessions survive restarts and scale across instances. InMemoryStore is only a
+// boot fallback for when DATABASE_URL is unset — auth is disabled in that case.
+const sessionOptions = {
+  name: SESSION_COOKIE,
+  secret: sessionSecret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: isProduction,
+    maxAge: MAX_SESSION_AGE_MS,
+  },
 }
-
-function getAuthUrl() {
-  const oauth2Client = createOAuthClient()
-  return oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    include_granted_scopes: true,
-    scope: [
-      'openid',
-      'email',
-      'profile',
-      'https://www.googleapis.com/auth/webmasters.readonly',
-    ],
+if (dbConfigured) {
+  const PgStore = connectPgSimple(session)
+  sessionOptions.store = new PgStore({
+    pool: getPool(),
+    tableName: 'session',
+    createTableIfMissing: false, // created by db/migrations
+    pruneSessionInterval: 60 * 15, // seconds
   })
+} else {
+  // Never used for real auth; only lets the process boot so the UI can explain
+  // that PostgreSQL must be configured.
+  sessionOptions.store = new session.MemoryStore()
+}
+app.use(session(sessionOptions))
+
+// --- Auth helpers ---------------------------------------------------------
+
+function redirectError(res, message) {
+  return res.redirect(`/?error=${encodeURIComponent(message)}`)
 }
 
-function getAuthorizedClient(req) {
-  if (!req.session.tokens) return null
-
-  const oauth2Client = createOAuthClient()
-  oauth2Client.setCredentials(req.session.tokens)
-  oauth2Client.on('tokens', (tokens) => {
-    req.session.tokens = { ...req.session.tokens, ...tokens }
-    req.session.save(() => {})
-  })
-  return oauth2Client
+function unauthorized(res, message = 'برای ادامه ابتدا با حساب گوگل وارد شوید.') {
+  return res.status(401).json({ error: 'AUTH_REQUIRED', message })
 }
 
-function requireAuth(req, res, next) {
-  if (!req.session.tokens || !req.session.user) {
-    return res.status(401).json({
-      error: 'AUTH_REQUIRED',
-      message: 'برای ادامه ابتدا با حساب گوگل وارد شوید.',
-    })
-  }
-  next()
-}
-
-function getApiError(error) {
-  return (
-    error?.response?.data?.error?.message ||
-    error?.errors?.[0]?.message ||
-    error?.message ||
-    'ارتباط با Google Search Console ناموفق بود.'
-  )
-}
-
-function toDateString(date) {
-  return date.toISOString().slice(0, 10)
-}
-
-function shiftDate(dateString, amount) {
-  const date = new Date(`${dateString}T12:00:00.000Z`)
-  date.setUTCDate(date.getUTCDate() + amount)
-  return toDateString(date)
-}
-
-function isDateString(value) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false
-  const date = new Date(`${value}T12:00:00.000Z`)
-  return !Number.isNaN(date.getTime()) && toDateString(date) === value
-}
-
-function defaultRange(days = 28) {
-  // Search Console data is commonly delayed by a couple of days, so avoid
-  // requesting today by default while still allowing a custom end date.
-  const safeDays = Math.min(Math.max(Number(days) || 28, 7), 90)
-  const endDate = shiftDate(toDateString(new Date()), -2)
-  return {
-    startDate: shiftDate(endDate, -(safeDays - 1)),
-    endDate,
-    days: safeDays,
-  }
-}
-
-function readRange(query) {
-  const fallback = defaultRange(query.days)
-  const startDate = isDateString(query.startDate) ? query.startDate : fallback.startDate
-  const endDate = isDateString(query.endDate) ? query.endDate : fallback.endDate
-
-  if (startDate > endDate) {
-    return { ...fallback, invalid: true }
-  }
-
-  const start = new Date(`${startDate}T12:00:00.000Z`)
-  const end = new Date(`${endDate}T12:00:00.000Z`)
-  const days = Math.round((end - start) / 86400000) + 1
-
-  if (days < 1 || days > 90) return { ...fallback, invalid: true }
-  return { startDate, endDate, days }
-}
-
-async function listAccessibleSites(auth) {
-  const searchConsole = google.searchconsole({ version: 'v1', auth })
-  const { data } = await searchConsole.sites.list()
-  return (data.siteEntry || []).map((site) => ({
-    siteUrl: site.siteUrl,
-    permissionLevel: site.permissionLevel || 'Unknown',
-  }))
-}
-
-async function assertAccessibleSite(auth, siteUrl) {
-  if (!siteUrl || typeof siteUrl !== 'string' || siteUrl.length > 2048) {
-    const error = new Error('یک property معتبر برای Search Console انتخاب کنید.')
-    error.statusCode = 400
-    throw error
-  }
-
-  const sites = await listAccessibleSites(auth)
-  const selected = sites.find((site) => site.siteUrl === siteUrl)
-  if (!selected) {
-    const error = new Error('این property در حساب گوگل شما پیدا نشد یا دسترسی خواندن آن را ندارید.')
-    error.statusCode = 403
-    throw error
-  }
-  return selected
-}
-
-async function searchAnalyticsQuery(auth, siteUrl, startDate, endDate, dimensions = [], rowLimit = 1000) {
-  const searchConsole = google.searchconsole({ version: 'v1', auth })
-  const requestBody = {
-    startDate,
-    endDate,
-    dataState: 'final',
-    rowLimit,
-  }
-  if (dimensions.length) requestBody.dimensions = dimensions
-
-  const { data } = await searchConsole.searchanalytics.query({
-    siteUrl,
-    requestBody,
-  })
-  return data.rows || []
-}
-
-function aggregateRows(rows) {
-  if (!rows?.length) {
-    return { clicks: 0, impressions: 0, ctr: 0, position: 0 }
-  }
-  if (rows.length === 1 && !rows[0].keys?.length) {
-    return {
-      clicks: Number(rows[0].clicks || 0),
-      impressions: Number(rows[0].impressions || 0),
-      ctr: Number(rows[0].ctr || 0),
-      position: Number(rows[0].position || 0),
+/**
+ * requireUser loads the current user from Postgres based only on the id held in
+ * the session. Every downstream call uses this user's own decrypted tokens, so
+ * data is naturally isolated per user.
+ */
+async function requireUser(req, res, next) {
+  const userId = req.session?.userId
+  if (!userId) return unauthorized(res)
+  try {
+    const user = await findUserById(userId)
+    if (!user) {
+      req.session.destroy(() => res.clearCookie(SESSION_COOKIE))
+      return unauthorized(res, 'نشست شما منقضی شده است؛ دوباره وارد شوید.')
     }
-  }
-
-  const totals = rows.reduce(
-    (result, row) => {
-      const impressions = Number(row.impressions || 0)
-      result.clicks += Number(row.clicks || 0)
-      result.impressions += impressions
-      result.weightedPosition += Number(row.position || 0) * (impressions || 1)
-      return result
-    },
-    { clicks: 0, impressions: 0, weightedPosition: 0 },
-  )
-
-  return {
-    clicks: totals.clicks,
-    impressions: totals.impressions,
-    ctr: totals.impressions ? totals.clicks / totals.impressions : 0,
-    position: totals.impressions ? totals.weightedPosition / totals.impressions : 0,
-  }
-}
-
-function rowItem(row, keyName) {
-  return {
-    [keyName]: row.keys?.[0] || '',
-    clicks: Number(row.clicks || 0),
-    impressions: Number(row.impressions || 0),
-    ctr: Number(row.ctr || 0),
-    position: Number(row.position || 0),
-  }
-}
-
-function percentChange(current, previous) {
-  if (!previous) return current ? null : 0
-  return ((current - previous) / previous) * 100
-}
-
-function metricChanges(current, previous) {
-  return {
-    clicks: percentChange(current.clicks, previous.clicks),
-    impressions: percentChange(current.impressions, previous.impressions),
-    ctr: percentChange(current.ctr, previous.ctr),
-    position: percentChange(current.position, previous.position),
-  }
-}
-
-function buildInsights(summary, queryRows, pageRows, deviceRows, previousSummary) {
-  if (!summary.impressions) {
-    return [
-      {
-        id: 'no-data',
-        tone: 'info',
-        label: 'داده کافی نیست',
-        title: 'برای این بازه داده‌ای ثبت نشده است',
-        description: 'بازه‌ی زمانی را بزرگ‌تر کنید یا مطمئن شوید property انتخاب‌شده در Search Console فعال است.',
-      },
-    ]
-  }
-
-  const insights = []
-  const lowCtrQuery = [...queryRows]
-    .filter((row) => row.impressions >= 50 && row.position > 0 && row.position <= 12 && row.ctr < Math.max(summary.ctr * 0.8, 0.02))
-    .sort((a, b) => b.impressions - a.impressions)[0]
-
-  if (lowCtrQuery) {
-    insights.push({
-      id: 'ctr-opportunity',
-      tone: 'warning',
-      label: 'فرصت رشد',
-      title: 'CTR یک عبارت مهم پایین است',
-      description: `عبارت «${lowCtrQuery.query}» با ${formatCompact(lowCtrQuery.impressions)} نمایش، جایگاه ${formatPosition(lowCtrQuery.position)} دارد اما CTR آن ${formatPercent(lowCtrQuery.ctr)} است. عنوان و توضیحات نتیجه را بازنویسی کنید.`,
+    req.user = user
+    return next()
+  } catch (error) {
+    console.error('Could not load user from the database:', error?.message || error)
+    return res.status(503).json({
+      error: 'DB_UNAVAILABLE',
+      message: 'داده‌پایه در دسترس نیست. اتصال PostgreSQL را بررسی کنید.',
     })
   }
-
-  const nearPageOne = [...queryRows]
-    .filter((row) => row.impressions >= 30 && row.position >= 4 && row.position <= 15)
-    .sort((a, b) => b.impressions - a.impressions)[0]
-
-  if (nearPageOne) {
-    insights.push({
-      id: 'page-one',
-      tone: 'success',
-      label: 'سریع‌ترین برد',
-      title: 'یک عبارت تا صفحه اول فاصله کمی دارد',
-      description: `«${nearPageOne.query}» در جایگاه ${formatPosition(nearPageOne.position)} دیده می‌شود. با تقویت لینک‌سازی داخلی و کامل‌تر کردن محتوای همین صفحه، شانس رشد آن را بالا ببرید.`,
-    })
-  }
-
-  const lowCtrPage = [...pageRows]
-    .filter((row) => row.impressions >= 100 && row.ctr < Math.max(summary.ctr * 0.75, 0.015))
-    .sort((a, b) => b.impressions - a.impressions)[0]
-
-  if (lowCtrPage) {
-    insights.push({
-      id: 'page-snippet',
-      tone: 'neutral',
-      label: 'بهینه‌سازی اسنیپت',
-      title: 'یک صفحه بازدید زیادی می‌گیرد اما کلیک کمی دارد',
-      description: `${shortenUrl(lowCtrPage.page)} با ${formatCompact(lowCtrPage.impressions)} نمایش، CTR ${formatPercent(lowCtrPage.ctr)} دارد. عنوان، متا دیسکریپشن و تطابق آن با نیت جست‌وجو را بررسی کنید.`,
-    })
-  }
-
-  const mobile = deviceRows.find((row) => row.device === 'MOBILE')
-  const desktop = deviceRows.find((row) => row.device === 'DESKTOP')
-  if (mobile && desktop && mobile.impressions > desktop.impressions * 1.4 && mobile.ctr < desktop.ctr * 0.8) {
-    insights.push({
-      id: 'mobile-gap',
-      tone: 'warning',
-      label: 'تجربه موبایل',
-      title: 'شکاف CTR موبایل قابل توجه است',
-      description: `موبایل ${formatPercent(mobile.ctr)} CTR دارد، در حالی که دسکتاپ ${formatPercent(desktop.ctr)} است. سرعت، خوانایی و جایگاه CTA را در موبایل بررسی کنید.`,
-    })
-  }
-
-  if (previousSummary.impressions && previousSummary.clicks < summary.clicks) {
-    insights.push({
-      id: 'positive-trend',
-      tone: 'success',
-      label: 'روند مثبت',
-      title: 'کلیک‌ها نسبت به دوره قبل رشد کرده‌اند',
-      description: `کلیک‌های ارگانیک این دوره ${formatChange(percentChange(summary.clicks, previousSummary.clicks))} بیشتر شده است. صفحاتی را که بیشترین سهم را در این رشد داشته‌اند، به‌روزرسانی کنید.`,
-    })
-  }
-
-  if (!insights.length) {
-    insights.push({
-      id: 'steady',
-      tone: 'info',
-      label: 'پایش',
-      title: 'عملکرد پایدار است؛ روی کوئری‌های پربازدید تمرکز کنید',
-      description: 'برای پیدا کردن فرصت‌های جدید، عبارت‌های جدول پایین را با نیت جست‌وجو و محتوای صفحات مقصد تطبیق دهید.',
-    })
-  }
-
-  return insights.slice(0, 4)
 }
 
-function formatCompact(number) {
-  return new Intl.NumberFormat('fa-IR', { notation: 'compact', maximumFractionDigits: 1 }).format(number)
+/** Builds a Google OAuth client authorized with the current user's decrypted tokens. */
+async function getAuthorizedClient(req) {
+  const tokens = await getDecryptedTokens(req.user.id)
+  if (!tokens || (!tokens.access_token && !tokens.refresh_token)) {
+    const error = new Error('توکن دسترسی گوگل این حساب در دسترس نیست؛ دوباره وارد شوید.')
+    error.statusCode = 401
+    throw error
+  }
+  return buildAuthorizedClient(tokens, (freshTokens) => {
+    updateAccountTokens(req.user.id, freshTokens).catch((error) => {
+      console.error('Could not persist refreshed tokens for user', req.user?.id, ':', error?.message || error)
+    })
+  })
 }
 
-function formatPercent(value) {
-  return new Intl.NumberFormat('fa-IR', { style: 'percent', maximumFractionDigits: 1 }).format(value || 0)
-}
-
-function formatPosition(value) {
-  return new Intl.NumberFormat('fa-IR', { maximumFractionDigits: 1 }).format(value || 0)
-}
-
-function formatChange(value) {
-  if (value === null || value === undefined) return 'بدون سابقه کافی'
-  return new Intl.NumberFormat('fa-IR', { style: 'percent', maximumFractionDigits: 1 }).format(value / 100)
-}
-
-// --- Authentication -------------------------------------------------------
+// --- Authentication routes ------------------------------------------------
 
 app.get('/auth/google', (req, res) => {
-  if (!isConfigured) {
-    return res.redirect('/?error=oauth_not_configured')
+  if (!isReady) {
+    return res.redirect('/?error=server_not_configured')
   }
-
   const state = crypto.randomBytes(24).toString('hex')
   req.session.oauthState = state
   return res.redirect(`${getAuthUrl()}&state=${encodeURIComponent(state)}`)
 })
 
 app.get('/auth/google/callback', async (req, res) => {
-  if (!isConfigured) return res.redirect('/?error=oauth_not_configured')
-
+  if (!isReady) return res.redirect('/?error=server_not_configured')
   if (!req.query.code || !req.query.state || req.query.state !== req.session.oauthState) {
     return res.redirect('/?error=oauth_state')
   }
 
+  let tokens
+  let profile
   try {
-    const oauth2Client = createOAuthClient()
-    const { tokens } = await oauth2Client.getToken(String(req.query.code))
-    oauth2Client.setCredentials(tokens)
-    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client })
-    const { data: profile } = await oauth2.userinfo.get()
+    // 1) Exchange the code and read the Google profile.
+    const result = await exchangeCodeForTokens(String(req.query.code))
+    tokens = result.tokens
+    profile = result.profile
 
-    req.session.tokens = tokens
-    req.session.user = {
-      id: profile.id,
-      name: profile.name || profile.email?.split('@')[0] || 'کاربر گوگل',
+    // 2) Upsert the user row (multi-user safe).
+    const user = await upsertUser({
+      googleId: profile.id,
       email: profile.email || '',
+      name: profile.name || profile.email?.split('@')[0] || 'کاربر گوگل',
       picture: profile.picture || '',
-    }
-    delete req.session.oauthState
+    })
 
-    req.session.save((error) => {
+    // 3) Persist the (encrypted) token set keyed to this user.
+    await upsertOAuthAccount({
+      userId: user.id,
+      googleId: profile.id,
+      email: profile.email || '',
+      name: profile.name || '',
+      picture: profile.picture || '',
+      tokens,
+    })
+
+    // 4) The session only ever stores the user id — never tokens.
+    req.session.userId = user.id
+    delete req.session.oauthState
+    return req.session.save((error) => {
       if (error) return res.redirect('/?error=session')
       return res.redirect('/')
     })
   } catch (error) {
-    console.error('Google OAuth callback failed:', getApiError(error))
-    return res.redirect(`/?error=${encodeURIComponent('ورود با گوگل ناموفق بود. تنظیمات OAuth را بررسی کنید.')}`)
+    console.error('Google OAuth callback failed:', getGoogleApiError(error))
+    return redirectError(res, 'ورود با گوگل ناموفق بود. تنظیمات OAuth و PostgreSQL را بررسی کنید.')
   }
 })
 
 app.post('/auth/logout', (req, res) => {
   req.session.destroy(() => {
-    res.clearCookie('searchlight.sid')
+    res.clearCookie(SESSION_COOKIE)
     res.json({ ok: true })
   })
 })
 
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
+  let user = null
+  if (req.session?.userId && dbConfigured) {
+    try {
+      user = await findUserById(req.session.userId)
+    } catch (error) {
+      console.error('Could not load user for /api/auth/me:', error?.message || error)
+    }
+  }
   res.json({
-    authenticated: Boolean(req.session.user && req.session.tokens),
-    configured: isConfigured,
-    demoMode,
-    user: req.session.user || null,
+    authenticated: Boolean(user && req.session.userId),
+    configured: isReady,
+    demoMode: false,
+    // Tell the client *why* real data is off, so it can show a helpful hint.
+    missing: {
+      oauth: !oauthConfigured,
+      database: !dbConfigured,
+      encryption: !encryptionConfigured,
+    },
+    user: user
+      ? { id: user.id, name: user.name, email: user.email, picture: user.picture }
+      : null,
   })
 })
 
-// --- Search Console data --------------------------------------------------
+// --- Search Console data (always scoped to req.user) ----------------------
 
-app.get('/api/sites', requireAuth, async (req, res) => {
+app.get('/api/sites', requireUser, async (req, res) => {
   try {
-    const auth = getAuthorizedClient(req)
+    const auth = await getAuthorizedClient(req)
     const sites = await listAccessibleSites(auth)
-    res.json({ sites })
+    // Keep each user's property list in Postgres so associations are durable.
+    try {
+      await syncUserSites(req.user.id, sites)
+    } catch (error) {
+      console.error('Could not persist user sites:', error?.message || error)
+    }
+    const stored = await listUserSites(req.user.id)
+    const syncedAtByUrl = Object.fromEntries(stored.map((s) => [s.siteUrl, s.lastSyncedAt]))
+    res.json({
+      sites: sites.map((site) => ({
+        ...site,
+        lastSyncedAt: syncedAtByUrl[site.siteUrl] || null,
+      })),
+    })
   } catch (error) {
-    console.error('Could not list Search Console sites:', getApiError(error))
-    res.status(error?.response?.status || 502).json({
+    console.error('Could not list Search Console sites:', getGoogleApiError(error))
+    res.status(error?.statusCode || error?.response?.status || 502).json({
       error: 'SEARCH_CONSOLE_ERROR',
-      message: getApiError(error),
+      message: getGoogleApiError(error),
     })
   }
 })
 
-app.get('/api/dashboard', requireAuth, async (req, res) => {
+app.get('/api/dashboard', requireUser, async (req, res) => {
   const siteUrl = String(req.query.siteUrl || '')
   const range = readRange(req.query)
   if (range.invalid) {
@@ -432,7 +256,8 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
   }
 
   try {
-    const auth = getAuthorizedClient(req)
+    const auth = await getAuthorizedClient(req)
+    // Authoritative check that this property belongs to THIS user's account.
     const site = await assertAccessibleSite(auth, siteUrl)
     const previousEndDate = shiftDate(range.startDate, -1)
     const previousStartDate = shiftDate(previousEndDate, -(range.days - 1))
@@ -453,7 +278,6 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     const devices = deviceRows
       .map((row) => ({ ...rowItem(row, 'device'), device: String(row.keys?.[0] || '').toUpperCase() }))
       .sort((a, b) => b.impressions - a.impressions)
-
     const trend = trendRows
       .map((row) => ({
         date: row.keys?.[0] || '',
@@ -466,15 +290,9 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
 
     return res.json({
       site,
-      range: {
-        ...range,
-        previousStartDate,
-        previousEndDate,
-      },
-      metrics: {
-        ...summary,
-        changes: metricChanges(summary, previousSummary),
-      },
+      user: { id: req.user.id, email: req.user.email },
+      range: { ...range, previousStartDate, previousEndDate },
+      metrics: { ...summary, changes: metricChanges(summary, previousSummary) },
       trend,
       topQueries,
       topPages,
@@ -484,17 +302,43 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     })
   } catch (error) {
     const status = error.statusCode || error?.response?.status || 502
-    console.error('Search Console dashboard request failed:', getApiError(error))
+    console.error('Search Console dashboard request failed:', getGoogleApiError(error))
     return res.status(status).json({
       error: status === 403 ? 'PROPERTY_NOT_ACCESSIBLE' : 'SEARCH_CONSOLE_ERROR',
-      message: getApiError(error),
+      message: getGoogleApiError(error),
     })
   }
 })
 
-app.get('/health', (_req, res) => res.json({ ok: true }))
+app.get('/health', async (_req, res) => {
+  let db = 'unconfigured'
+  if (dbConfigured) {
+    try {
+      await getPool().query('SELECT 1')
+      db = 'ok'
+    } catch {
+      db = 'unreachable'
+    }
+  }
+  res.json({ ok: true, db, ready: isReady })
+})
+
+// --- Boot -----------------------------------------------------------------
 
 async function start() {
+  // Apply pending DB migrations before serving traffic.
+  if (dbConfigured) {
+    try {
+      await runMigrations()
+    } catch (error) {
+      console.error('[startup] PostgreSQL migration failed — aborting startup.')
+      console.error(error?.message || error)
+      process.exit(1)
+    }
+  } else {
+    console.warn('[startup] DATABASE_URL is not set — multi-user/persistence is disabled.')
+  }
+
   if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true, host: '0.0.0.0' },
@@ -523,11 +367,28 @@ async function start() {
 
   app.listen(port, '0.0.0.0', () => {
     console.log(`Searchlight is running on http://0.0.0.0:${port}`)
-    if (!isConfigured) console.log('Google OAuth is not configured. Add values from .env.example to enable real data.')
+    if (!isReady) {
+      console.log(
+        'Real data is disabled. Required to enable: ' +
+          `${oauthConfigured ? '' : 'GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI '}` +
+          `${dbConfigured ? '' : 'DATABASE_URL '}` +
+          `${encryptionConfigured ? '' : 'ENCRYPTION_KEY '}` +
+          '(see .env.example).',
+      )
+    }
   })
 }
 
 start().catch((error) => {
-  console.error(error)
+  console.error('Server failed to start:', error?.message || error)
   process.exit(1)
 })
+
+// Graceful shutdown: close the DB pool so in-flight writes finish cleanly.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    closePool()
+      .catch(() => {})
+      .finally(() => process.exit(0))
+  })
+}
