@@ -1,21 +1,25 @@
 {
   "name": "searchlight-console",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "A Persian SEO workspace powered by real Google Search Console data.",
+  "description": "A Persian multi-user SEO workspace powered by real Google Search Console data (PostgreSQL + encrypted OAuth tokens).",
   "scripts": {
     "dev": "node server.js",
     "build": "vite build",
-    "start": "NODE_ENV=production node server.js"
+    "start": "NODE_ENV=production node server.js",
+    "db:migrate": "node scripts/db-migrate.js",
+    "db:check": "node scripts/db-check.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "connect-pg-simple": "^10.0.0",
     "dotenv": "latest",
     "express": "latest",
     "express-session": "latest",
     "googleapis": "latest",
     "lucide-react": "latest",
+    "pg": "^8.23.0",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"
