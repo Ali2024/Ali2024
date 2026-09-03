@@ -1,0 +1,23 @@
+{
+  "name": "searchlight-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A Persian SEO workspace powered by real Google Search Console data.",
+  "scripts": {
+    "dev": "node server.js",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server.js"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "express-session": "latest",
+    "googleapis": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  }
+}
